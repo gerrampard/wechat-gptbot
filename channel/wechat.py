@@ -6,22 +6,28 @@ import requests
 from utils.log import logger
 from utils import const
 import os
-from utils.gen import gen_id
-from bot.chatgpt import ChatGPTBot
+from bot.bot import Bot
 from common.singleton import singleton
 from config import conf
 from utils.check import check_prefix, is_wx_account
-from common.reply import ReplyType
-import time
+from common.reply import ReplyType, Reply
+from channel.message import Message
+from utils.api import get_personal_info, send_image, send_file
+from utils.const import MessageType
+from utils.serialize import serialize_img, serialize_text, serialize_video
+from plugins.manager import PluginManager
+from common.context import ContextType, Context
+from plugins.event import EventType, Event
+from channel.channel import Channel
 
 
 @singleton
-class WeChatChannel:
+class WeChatChannel(Channel):
     def __init__(self):
         requests.packages.urllib3.disable_warnings()
         warnings.filterwarnings("ignore")
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
-        self.personal_info = self.get_personal_info()
+        self.personal_info = get_personal_info()
         self.ws = websocket.WebSocketApp(
             const.SERVER,
             on_open=self.on_open,
@@ -35,84 +41,84 @@ class WeChatChannel:
         self.ws.run_forever()
 
     def on_message(self, ws, message):
-        msg = json.loads(message)
-        msg_type = msg["type"]
+        raw_msg = json.loads(message)
+        msg_type = raw_msg["type"]
         handlers = {
-            const.AT_MSG: self.handle_message,
-            const.TXT_MSG: self.handle_message,
-            const.PIC_MSG: self.handle_message,
-            const.RECV_PIC_MSG: self.handle_message,
-            const.RECV_TXT_MSG: self.handle_message,
-            const.RECV_TXT_CITE_MSG: self.handle_cite_message,
-            const.HEART_BEAT: self.noop,
+            MessageType.AT_MSG.value: self.handle_message,
+            MessageType.TXT_MSG.value: self.handle_message,
+            MessageType.PIC_MSG.value: self.handle_message,
+            MessageType.RECV_PIC_MSG.value: self.handle_message,
+            MessageType.RECV_TXT_MSG.value: self.handle_message,
+            MessageType.RECV_TXT_CITE_MSG.value: self.handle_cite_message,
+            MessageType.HEART_BEAT.value: self.noop,
         }
-        handlers.get(msg_type, logger.info)(msg)
+        handlers.get(msg_type, logger.info)(raw_msg)
 
-    def noop(self, msg):
+    def noop(self, raw_msg):
         pass
 
-    def handle_cite_message(self, msg):
-        xml_msg = msg["content"]["content"].replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    def handle_cite_message(self, raw_msg):
+        xml_msg = (
+            raw_msg["content"]["content"]
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+        )
         soup = BeautifulSoup(xml_msg, "lxml")
         cooked_msg = {
             "content": soup.select_one("title").text,
-            "id": msg["id"],
-            "id1": msg["content"]["id2"],
+            "id": raw_msg["id"],
+            "id1": raw_msg["content"]["id2"],
             "id2": "",
             "id3": "",
-            "srvid": msg["srvid"],
-            "time": msg["time"],
-            "type": msg["type"],
-            "wxid": msg["content"]["id1"],
+            "srvid": raw_msg["srvid"],
+            "time": raw_msg["time"],
+            "type": raw_msg["type"],
+            "wxid": raw_msg["content"]["id1"],
         }
         self.handle_message(cooked_msg)
 
-    def handle_message(self, msg):
-        if "wxid" not in msg and msg["status"] == const.SUCCESS:
+    def handle_message(self, raw_msg):
+        if "wxid" not in raw_msg and raw_msg["status"] == const.SUCCESS:
             logger.info("message sent successfully")
             return
         # ignore message sent by self
-        if msg["id2"] == self.personal_info["wx_id"]:
+        if raw_msg["id2"] == self.personal_info["wx_id"]:
             logger.info("message sent by self, ignore")
             return
+        msg = Message(raw_msg, self.personal_info)
         logger.info(f"message received: {msg}")
-        if "@chatroom" in msg["wxid"]:
-            self.handle_group(msg)
+        e = PluginManager().emit(
+            Event(EventType.DID_RECEIVE_MESSAGE, {"channel": self, "message": msg})
+        )
+        if e.is_bypass:
+            return self.send(e.reply, e.message)
+        if e.message.is_group:
+            self.handle_group(e.message)
         else:
-            self.handle_single(msg)
+            self.handle_single(e.message)
 
-    def handle_group(self, msg):
-        room_id = msg["wxid"]
-        sender_id = msg["id1"]
-        query = msg["content"].strip()
-        personal_name = self.personal_info["wx_name"]
+    def handle_group(self, msg: Message):
         session_independent = conf().get("chat_group_session_independent")
-        context = dict()
-        context["session_id"] = sender_id if session_independent else room_id
-        sender_name = self.get_sender_name(room_id, sender_id)
-        atlist = msg["id3"]
-        if self.personal_info["wx_id"] in atlist:
-            cooked_query = query.replace(f"@{personal_name}", "", 1).strip()
+        context = Context()
+        context.session_id = msg.sender_id if session_independent else msg.room_id
+        if msg.is_at:
+            query = msg.content.replace(f"@{msg.receiver_name}", "", 1).strip()
+            context.query = query
             create_image_prefix = conf().get("create_image_prefix")
-            match_prefix = check_prefix(cooked_query, create_image_prefix)
+            match_prefix = check_prefix(query, create_image_prefix)
             if match_prefix:
-                context["type"] = const.CREATE_IMAGE
-            reply = ChatGPTBot().reply(cooked_query, context)
-            if reply.type == ReplyType.IMAGE:
-                self.send_img(reply.content, room_id)
-            else:
-                reply_msg = self.build_msg(reply.content, wxid=sender_id, room_id=room_id, nickname=sender_name)
-                self.ws.send(reply_msg)
+                context.type = ContextType.CREATE_IMAGE
+            self.handle_reply(msg, context)
 
-    def handle_single(self, msg):
-        sender_id = msg["wxid"]
+    def handle_single(self, msg: Message):
         # ignore message sent by public/subscription account
-        if not is_wx_account(sender_id):
+        if not is_wx_account(msg.sender_id):
             logger.info("message sent by public/subscription account, ignore")
             return
-        context = dict()
-        context["session_id"] = sender_id
-        query = msg["content"].strip()
+        context = Context()
+        context.session_id = msg.sender_id
+        query = msg.content
         single_chat_prefix = conf().get("single_chat_prefix")
         if single_chat_prefix is not None and len(single_chat_prefix) > 0:
             match_chat_prefix = check_prefix(query, single_chat_prefix)
@@ -121,115 +127,86 @@ class WeChatChannel:
             else:
                 logger.info("your message is not start with single_chat_prefix, ignore")
                 return
+        context.query = query
         create_image_prefix = conf().get("create_image_prefix")
         match_image_prefix = check_prefix(query, create_image_prefix)
         if match_image_prefix:
-            context["type"] = const.CREATE_IMAGE
-        reply = ChatGPTBot().reply(query, context)
-        if reply.type == ReplyType.IMAGE:
-            self.send_img(reply.content, sender_id)
-        else:
-            reply_msg = self.build_msg(reply.content, wxid=sender_id)
-            self.ws.send(reply_msg)
+            context.type = ContextType.CREATE_IMAGE
+        self.handle_reply(msg, context)
 
-    def send_img(self, content, wxid):
-        try:
-            # download image
-            path = os.path.abspath("./assets")
-            img_name = int(time.time() * 1000)
-            response = requests.get(content, stream=True)
-            response.raise_for_status()  # Raise exception if invalid response
-
-            with open(f"{path}\\{img_name}.png", "wb+") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-                f.close()
-            img_path = os.path.abspath(f"{path}\\{img_name}.png").replace("\\", "\\\\")
-
-            data = {
-                "id": gen_id(),
-                "type": const.PIC_MSG,
-                "roomid": "null",
-                "content": img_path,
-                "wxid": wxid,
-                "nickname": "null",
-                "ext": "null",
-            }
-            url = f"http://{const.IP}:{const.PORT}/api/sendpic"
-            res = requests.post(url, json={"para": data}, timeout=5)
-            if res.status_code == 200 and res.json()["status"] == const.SUCCESS:
-                logger.info("image sent successfully")
+    def decorate_reply(self, reply: Reply, msg: Message) -> Reply:
+        if reply.type == ReplyType.TEXT:
+            group_chat_reply_prefix = conf().get("group_chat_reply_prefix", "")
+            group_chat_reply_suffix = conf().get("group_chat_reply_suffix", "")
+            single_chat_reply_prefix = conf().get("single_chat_reply_prefix", "")
+            single_chat_reply_suffix = conf().get("single_chat_reply_suffix", "")
+            reply_text = reply.content
+            if msg.is_group:
+                reply_text = (
+                    group_chat_reply_prefix + reply_text + group_chat_reply_suffix
+                )
             else:
-                logger.error(f"[Server Error]: {res.text}")
-        except Exception as e:
-            logger.error(f"[Download Image Error]: {e}")
+                reply_text = (
+                    single_chat_reply_prefix + reply_text + single_chat_reply_suffix
+                )
+            reply.content = reply_text
+        return reply
 
-    def build_msg(self, content, wxid="null", room_id=None, nickname="null"):
-        if room_id:
-            msg_type = const.AT_MSG
-        else:
-            msg_type = const.TXT_MSG
-        if room_id is None:
-            room_id = "null"
-        msg = {
-            "id": gen_id(),
-            "type": msg_type,
-            "roomid": room_id,
-            "wxid": wxid,
-            "content": content,
-            "nickname": nickname,
-            "ext": "null",
-        }
-        return json.dumps(msg)
-
-    def get_personal_info(self):
-        uri = "/api/get_personal_info"
-        data = {
-            "id": gen_id(),
-            "type": const.PERSONAL_INFO,
-            "content": "op:personal info",
-            "wxid": "null",
-        }
-        try:
-            response = self.fetch(uri, data)
-            content = json.loads(response["content"])
-            logger.info(
-                f"""
-                wechat login info:
-                
-                nickName: {content['wx_name']}
-                account: {content['wx_code']}
-                wechatId: {content['wx_id']}
-                startTime: {response['time']}
-                """
+    def handle_reply(self, msg: Message, context: Context):
+        e1 = PluginManager().emit(
+            Event(
+                EventType.WILL_GENERATE_REPLY,
+                {"channel": self, "message": msg, "context": context},
             )
-            return content
-        except Exception as e:
-            logger.error("Get personal info failed!")
-            logger.exception(e)
+        )
+        if e1.is_bypass:
+            return self.send(e1.reply, e1.message)
 
-    # get sender's nickname in group chat
-    def get_sender_name(self, room_id, wxid):
-        uri = "api/getmembernick"
-        data = {"type": const.CHATROOM_MEMBER_NICK, "wxid": wxid, "roomid": room_id or "null"}
-        response = self.fetch(uri, data)
-        return json.loads(response["content"])["nick"]
+        rawReply = Bot().reply(e1.context)
 
-    def fetch(self, uri, data):
-        base_data = {
-            "id": gen_id(),
-            "type": "null",
-            "roomid": "null",
-            "wxid": "null",
-            "content": "null",
-            "nickname": "null",
-            "ext": "null",
-        }
-        base_data.update(data)
-        url = f"http://{const.IP}:{const.PORT}/{uri}"
-        response = requests.post(url, json={"para": base_data}, timeout=5)
-        return response.json()
+        e2 = PluginManager().emit(
+            Event(
+                EventType.WILL_DECORATE_REPLY,
+                {
+                    "channel": self,
+                    "message": e1.message,
+                    "context": e1.context,
+                    "reply": rawReply,
+                },
+            )
+        )
+        if e2.is_bypass:
+            return self.send(e2.reply, e2.message)
+
+        reply = self.decorate_reply(rawReply, msg)
+
+        e3 = PluginManager().emit(
+            Event(
+                EventType.WILL_SEND_REPLY,
+                {
+                    "channel": self,
+                    "message": e2.message,
+                    "context": e2.context,
+                    "reply": reply,
+                },
+            )
+        )
+        self.send(e3.reply, e3.message)
+
+    def send(self, reply: Reply, msg: Message):
+        if reply is None:
+            return
+        if reply.type == ReplyType.IMAGE:
+            img_path = serialize_img(reply.content)
+            wx_id = msg.room_id if msg.is_group else msg.sender_id
+            send_image(img_path, wx_id)
+        elif reply.type == ReplyType.VIDEO:
+            file_path = serialize_video(reply.content)
+            wx_id = msg.room_id if msg.is_group else msg.sender_id
+            send_file(file_path, wx_id)
+        else:
+            reply_msg = serialize_text(reply.content, msg)
+            self.ws.send(reply_msg)
 
     def on_open(self, ws):
         logger.info("[Websocket] connected")
